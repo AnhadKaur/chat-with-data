@@ -1,0 +1,16 @@
+# Secrets (never upload these)
+.env
+*.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Node
+node_modules/
+dist/
+
+# OS files
+.DS_Store
