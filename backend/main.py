@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 import chat_engine as ce
+from sample_data import make_sample_csv_bytes
 
 load_dotenv()          # reads the secret key from the .env file on your computer
 
@@ -21,6 +22,11 @@ load_dotenv()          # reads the secret key from the .env file on your compute
 MAX_UPLOAD_MB = 5          # biggest file we accept
 MAX_SESSIONS = 50          # how many visitors' datasets we keep in memory at once
 SESSION_MINUTES = 60       # a dataset is forgotten after this long without use
+MAX_QUESTIONS_PER_MINUTE = 6          # per visitor
+GLOBAL_QUESTIONS_PER_MINUTE = 20      # for the whole server, to protect the free AI quota
+
+# Websites allowed to talk to this server (comma separated). Add your live website address here later.
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
 
 ENGINE_LOCK = threading.Lock()      # the engine works on one dataset at a time, so questions take turns
 
@@ -39,7 +45,7 @@ app = FastAPI(title="Chat With Data", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],   # the website we build later
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -47,14 +53,39 @@ app.add_middleware(
 # Every visitor gets their own entry here: session id -> their cleaned table and report
 SESSIONS = {}
 
+RATE_LOCK = threading.Lock()
+ASKED = {}          # session id -> the times of that visitor's recent questions
+ASKED_ALL = []      # the times of recent questions from everyone
+
+
+def check_rate_limit(session_id):
+    """Allow a question, or stop with a friendly 'please wait' message."""
+    now = time.time()
+    with RATE_LOCK:
+        mine = [t for t in ASKED.get(session_id, []) if now - t < 60]
+        everyone = [t for t in ASKED_ALL if now - t < 60]
+        if len(mine) >= MAX_QUESTIONS_PER_MINUTE:
+            wait = int(60 - (now - mine[0])) + 1
+            raise HTTPException(status_code=429, headers={"Retry-After": str(wait)},
+                                detail=f"You're asking too quickly. Please wait {wait} seconds and try again.")
+        if len(everyone) >= GLOBAL_QUESTIONS_PER_MINUTE:
+            raise HTTPException(status_code=429, headers={"Retry-After": "30"},
+                                detail="The demo is very busy right now. Please try again in a moment.")
+        mine.append(now)
+        everyone.append(now)
+        ASKED[session_id] = mine
+        ASKED_ALL[:] = everyone
+
 
 def clean_old_sessions():
     cutoff = time.time() - SESSION_MINUTES * 60
     for sid in [s for s, v in SESSIONS.items() if v["last_used"] < cutoff]:
         del SESSIONS[sid]
+        ASKED.pop(sid, None)
     while len(SESSIONS) >= MAX_SESSIONS:                    # still full: drop the oldest
         oldest = min(SESSIONS, key=lambda s: SESSIONS[s]["last_used"])
         del SESSIONS[oldest]
+        ASKED.pop(oldest, None)
 
 
 def records(frame, n=50):
@@ -68,6 +99,23 @@ def column_kind(series):
     if pd.api.types.is_numeric_dtype(series):
         return "number"
     return "text"
+
+
+def new_session(frame, report):
+    clean_old_sessions()
+    session_id = uuid.uuid4().hex
+    SESSIONS[session_id] = {"df": frame, "report": report, "last_used": time.time()}
+    return session_id
+
+
+def session_response(session_id, frame, report):
+    return {
+        "session_id": session_id,
+        "rows": len(frame),
+        "columns": [{"name": c, "type": column_kind(frame[c])} for c in frame.columns],
+        "report": report,
+        "preview": records(frame, 5),
+    }
 
 
 @app.get("/health")
@@ -91,17 +139,28 @@ async def upload(file: UploadFile = File(...)):
     except ValueError as e:                                 # our own clear messages: empty file, too many rows...
         raise HTTPException(status_code=400, detail=str(e))
 
-    clean_old_sessions()
-    session_id = uuid.uuid4().hex
-    SESSIONS[session_id] = {"df": frame, "report": report, "last_used": time.time()}
+    session_id = new_session(frame, report)
+    return session_response(session_id, frame, report)
 
-    return {
-        "session_id": session_id,
-        "rows": len(frame),
-        "columns": [{"name": c, "type": column_kind(frame[c])} for c in frame.columns],
-        "report": report,
-        "preview": records(frame, 5),
-    }
+
+SAMPLE_QUESTIONS = [
+    "What is the total revenue?",
+    "Which region has the highest total revenue?",
+    "How many orders have no region?",
+    "Show a bar chart of revenue by category",
+    "Plot monthly revenue over time",
+    "Predict the revenue of an order of 5 Shoes at unit price 1500 in the West",
+]
+
+
+@app.post("/sample")
+def sample():
+    """Start a session with the built-in demo data, so visitors can try the app without a file."""
+    frame, report = ce.load_csv(make_sample_csv_bytes(), MAX_UPLOAD_MB)
+    session_id = new_session(frame, report)
+    out = session_response(session_id, frame, report)
+    out["suggested_questions"] = SAMPLE_QUESTIONS
+    return out
 
 
 class Question(BaseModel):
@@ -136,6 +195,7 @@ def ask(q: Question):
     if session is None:
         raise HTTPException(status_code=404, detail="Your data has expired. Please upload your file again.")
     session["last_used"] = time.time()
+    check_rate_limit(q.session_id)                          # stops visitors who ask too fast
 
     try:
         with ENGINE_LOCK:                                   # one question at a time
